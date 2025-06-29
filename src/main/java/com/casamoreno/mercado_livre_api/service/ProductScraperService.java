@@ -7,7 +7,6 @@ import org.openqa.selenium.JavascriptExecutor;
 import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.chrome.ChromeDriver;
 import org.openqa.selenium.chrome.ChromeOptions;
-import org.openqa.selenium.support.ui.WebDriverWait;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -28,14 +27,14 @@ public class ProductScraperService {
     }
 
     public ProductInfo scrapeFullProductInfo(String productUrl) {
-        // A URL já é limpa aqui, removendo parâmetros e fragmentos.
         String cleanUrl = productUrl.split("\\?")[0].split("#")[0];
         String htmlContent = getFullPageHtml(cleanUrl);
-        JsonNode preloadedState = extractPreloadedState(htmlContent);
+
+        // O extrator universal agora encontra o nó 'initialState' de qualquer tipo de página.
+        JsonNode initialState = extractInitialStateData(htmlContent);
 
         System.out.println("INFO: Mapeando os dados do JSON para o objeto ProductInfo...");
-        // A URL limpa (cleanUrl) é passada para o método de mapeamento.
-        ProductInfo productInfo = mapJsonToProductInfo(preloadedState, cleanUrl);
+        ProductInfo productInfo = mapInfoFromInitialState(initialState, cleanUrl);
         System.out.println("SUCESSO FINAL: Objeto ProductInfo criado com sucesso!");
         return productInfo;
     }
@@ -53,71 +52,94 @@ public class ProductScraperService {
         try {
             driver = new ChromeDriver(options);
             driver.get(url);
-            new WebDriverWait(driver, Duration.ofSeconds(20))
-                    .until(wd -> ((JavascriptExecutor) wd).executeScript("return window.__PRELOADED_STATE__ != null"));
+            // Pausa para garantir que todos os scripts, incluindo os de hidratação da página, sejam renderizados.
+            Thread.sleep(2500);
             return driver.getPageSource();
         } catch (Exception e) {
             throw new RuntimeException("Falha ao executar o Selenium: " + e.getMessage(), e);
         } finally {
-            if (driver != null) {
-                driver.quit();
-            }
+            if (driver != null) driver.quit();
         }
     }
 
-    private JsonNode extractPreloadedState(String html) {
-        Pattern pattern = Pattern.compile("window\\.__PRELOADED_STATE__\\s*=\\s*(\\{.*?\\});", Pattern.DOTALL);
-        Matcher matcher = pattern.matcher(html);
-        if (matcher.find()) {
-            try {
-                return objectMapper.readTree(matcher.group(1));
-            } catch (IOException e) {
-                throw new RuntimeException("Falha ao parsear o JSON do __PRELOADED_STATE__.", e);
+    /**
+     * Extrai o bloco de dados 'initialState' da página, tentando múltiplos padrões para garantir a compatibilidade.
+     */
+    private JsonNode extractInitialStateData(String html) {
+        try {
+            // Estratégia 1: Busca por __PRELOADED_STATE__ em uma tag <script> (Páginas /MLB-)
+            // A Regex agora é flexível quanto à ordem dos atributos da tag.
+            Pattern scriptTagPattern = Pattern.compile("<script\\s+[^>]*?id=\"__PRELOADED_STATE__\"[^>]*?>(.*?)</script>", Pattern.DOTALL);
+            Matcher scriptTagMatcher = scriptTagPattern.matcher(html);
+            if (scriptTagMatcher.find()) {
+                System.out.println("INFO: JSON do tipo 'script __PRELOADED_STATE__' detectado.");
+                JsonNode rootNode = objectMapper.readTree(scriptTagMatcher.group(1));
+                return rootNode.path("pageState").path("initialState");
             }
+
+            // Estratégia 2: Busca por window.__PRELOADED_STATE__ (Páginas /p/)
+            Pattern windowVarPattern = Pattern.compile("window\\.__PRELOADED_STATE__\\s*=\\s*(\\{.*?\\});", Pattern.DOTALL);
+            Matcher windowVarMatcher = windowVarPattern.matcher(html);
+            if (windowVarMatcher.find()) {
+                System.out.println("INFO: JSON do tipo 'window.__PRELOADED_STATE__' detectado.");
+                JsonNode rootNode = objectMapper.readTree(windowVarMatcher.group(1));
+                return rootNode.path("initialState");
+            }
+
+        } catch (IOException e) {
+            throw new RuntimeException("Falha ao parsear o JSON principal da página.", e);
         }
-        throw new RuntimeException("Não foi possível extrair o __PRELOADED_STATE__ do HTML.");
+
+        throw new RuntimeException("Não foi possível encontrar um bloco de dados JSON compatível na página.");
     }
 
-    private ProductInfo mapJsonToProductInfo(JsonNode rootNode, String cleanUrl) {
+    /**
+     * Mapeador unificado que extrai dados do nó 'initialState'.
+     */
+    private ProductInfo mapInfoFromInitialState(JsonNode initialState, String cleanUrl) {
         ProductInfo.ProductInfoBuilder builder = ProductInfo.builder();
-        JsonNode initialState = rootNode.path("initialState");
         JsonNode components = initialState.path("components");
 
-        extractCoreInfo(builder, initialState, components, cleanUrl);
-        extractPriceInfo(builder, components);
-        extractGalleryInfo(builder, components);
-        extractOtherInfo(builder, components);
+        builder.mercadoLivreId(initialState.path("id").asText(null));
+        builder.mercadoLivreUrl(cleanUrl);
+
+        JsonNode headerNode = findNode(components, "header", "short_description");
+        JsonNode priceNode = findNode(components, "price", "short_description");
+        JsonNode galleryNode = findNode(components, "gallery", "fixed");
+        JsonNode descriptionNode = findNode(components, "description", "content_bottom");
+        JsonNode stockNode = findNode(components, "stock_information", "short_description");
+        JsonNode schemaData = initialState.path("schema").path(0);
+
+        builder.productTitle(headerNode.path("title").asText(null));
+        builder.fullDescription(descriptionNode.path("content").asText(null));
+
+        String brand = schemaData.path("brand").path("name").asText(null);
+        if(brand == null) brand = schemaData.path("brand").asText(null);
+        builder.productBrand(brand);
+
+        String conditionText = headerNode.path("subtitle").asText("");
+        if(conditionText.toLowerCase().contains("novo")) builder.productCondition("Novo");
+        else if(conditionText.toLowerCase().contains("usado")) builder.productCondition("Usado");
+        else builder.productCondition(extractConditionFromSchema(schemaData));
+
+        extractPriceInfo(builder, priceNode);
+        extractGalleryInfo(builder, galleryNode);
+        builder.stockStatus(stockNode.path("title").path("text").asText("Disponível"));
 
         return builder.build();
     }
 
-    private void extractCoreInfo(ProductInfo.ProductInfoBuilder builder, JsonNode initialState, JsonNode components, String cleanUrl) {
-        JsonNode schemaData = initialState.path("schema").path(0);
+    // --- MÉTODOS AUXILIARES ---
 
-        builder.mercadoLivreId(initialState.path("id").asText(null));
+    private void extractPriceInfo(ProductInfo.ProductInfoBuilder builder, JsonNode priceComponent) {
+        JsonNode priceDetails = priceComponent.path("price");
+        if(priceDetails.isMissingNode()) priceDetails = priceComponent;
 
-        // MELHORIA APLICADA AQUI
-        // Agora, usamos a 'cleanUrl' que foi tratada no início, ignorando a URL com parâmetros do JSON.
-        builder.mercadoLivreUrl(cleanUrl)
-                .productTitle(components.path("header").path("title").asText(null))
-                .fullDescription(components.path("description").path("content").asText(null))
-                .productBrand(schemaData.path("brand").asText(null))
-                .productCondition(extractCondition(schemaData));
-    }
-
-    private void extractPriceInfo(ProductInfo.ProductInfoBuilder builder, JsonNode components) {
-        JsonNode priceComponent = components.path("price");
-        JsonNode priceNode = priceComponent.path("price");
-
-        if (!priceNode.path("value").isMissingNode()) {
-            builder.currentPrice(BigDecimal.valueOf(priceNode.path("value").asDouble()));
-        }
-        if (!priceNode.path("original_value").isMissingNode()) {
-            builder.originalPrice(BigDecimal.valueOf(priceNode.path("original_value").asDouble()));
-        }
+        if (!priceDetails.path("value").isMissingNode()) builder.currentPrice(BigDecimal.valueOf(priceDetails.path("value").asDouble()));
+        if (!priceDetails.path("original_value").isMissingNode()) builder.originalPrice(BigDecimal.valueOf(priceDetails.path("original_value").asDouble()));
 
         JsonNode discountLabel = priceComponent.path("discount_label");
-        if (!discountLabel.path("value").isMissingNode()) {
+        if (!discountLabel.isMissingNode() && !discountLabel.path("value").isMissingNode()) {
             builder.discountPercentage(discountLabel.path("value").asText() + "% OFF");
         }
 
@@ -130,17 +152,18 @@ public class ProductScraperService {
         }
     }
 
-    private void extractGalleryInfo(ProductInfo.ProductInfoBuilder builder, JsonNode components) {
-        JsonNode galleryNode = components.path("gallery");
+    private void extractGalleryInfo(ProductInfo.ProductInfoBuilder builder, JsonNode galleryNode) {
         JsonNode picturesNode = galleryNode.path("pictures");
         String zoomTemplateUrl = galleryNode.path("picture_config").path("template_zoom").asText();
-
         List<String> imageUrls = new ArrayList<>();
+
         if (picturesNode.isArray() && !zoomTemplateUrl.isEmpty()) {
             for (JsonNode pictureNode : picturesNode) {
                 String pictureId = pictureNode.path("id").asText(null);
                 if (pictureId != null) {
-                    String finalUrl = zoomTemplateUrl.replace("{id}", pictureId).replace("{sanitizedTitle}", "");
+                    String sanitizedTitle = pictureNode.path("sanitized_title").asText("");
+                    String finalUrl = zoomTemplateUrl.replace("{id}", pictureId)
+                            .replace("{sanitizedTitle}", sanitizedTitle);
                     imageUrls.add(finalUrl);
                 }
             }
@@ -148,12 +171,19 @@ public class ProductScraperService {
         builder.galleryImageUrls(imageUrls);
     }
 
-    private void extractOtherInfo(ProductInfo.ProductInfoBuilder builder, JsonNode components) {
-        builder.stockStatus(components.path("stock_information").path("title").path("text").asText("Indisponível"));
-    }
-
-    private String extractCondition(JsonNode schemaData) {
+    private String extractConditionFromSchema(JsonNode schemaData) {
         String conditionUrl = schemaData.path("itemCondition").asText("");
         return conditionUrl.contains("NewCondition") ? "Novo" : (conditionUrl.contains("UsedCondition") ? "Usado" : null);
+    }
+
+    private JsonNode findNode(JsonNode baseNode, String primaryPath, String secondaryPath) {
+        JsonNode node = baseNode.path(primaryPath);
+        if (node.isMissingNode() || node.isNull()) {
+            node = baseNode.path(secondaryPath);
+            if(node.isArray() && node.size() > 0){
+                return node.get(0);
+            }
+        }
+        return node;
     }
 }
