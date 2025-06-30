@@ -27,13 +27,8 @@ public class ProductSyncService {
 
     private static final Logger logger = LoggerFactory.getLogger(ProductSyncService.class);
 
-    // Códigos de Cores ANSI para o console
     public static final String ANSI_RESET = "\u001B[0m";
     public static final String ANSI_RED_BOLD = "\u001B[1;31m";
-    public static final String ANSI_GREEN_BOLD = "\u001B[1;32m";
-    public static final String ANSI_YELLOW_BOLD = "\u001B[1;33m";
-    public static final String ANSI_BLUE_BOLD = "\u001B[1;34m";
-    public static final String ANSI_CYAN = "\u001B[0;36m";
 
     private final ProductScraperService scraperService;
     private final CasaMorenoClient casaMorenoClient;
@@ -57,6 +52,9 @@ public class ProductSyncService {
 
     @Async
     public CompletableFuture<Void> runFullSynchronization(SseEmitter emitter) {
+        long successfulUpdatesCount = 0; // Contador de atualizações bem-sucedidas
+        List<ProductComparisonResult> results = new ArrayList<>();
+
         try {
             sendSseEvent(emitter, "INFO", "Iniciando processo de sincronização e atualização...");
 
@@ -68,7 +66,6 @@ public class ProductSyncService {
 
             for (int i = 0; i < productDtosFromDb.size(); i++) {
                 ProductDetailsResponse productDto = productDtosFromDb.get(i);
-
                 String productIdentifier = String.format("'%s' (ID: %s)", productDto.productTitle(), productDto.productId());
 
                 if (productDto.mercadoLivreUrl() == null || productDto.mercadoLivreUrl().isEmpty()) {
@@ -83,10 +80,12 @@ public class ProductSyncService {
                     ProductInfo newProductInfo = scraperService.scrapeFullProductInfo(oldProductInfo.getMercadoLivreUrl());
                     ProductComparisonResult comparison = compareFields(oldProductInfo, newProductInfo);
 
-                    // ** LÓGICA DE ATUALIZAÇÃO **
                     if (comparison.isHasChanges()) {
                         sendSseEvent(emitter, "WARN", "--> Mudanças detectadas para " + productIdentifier + ". Preparando para atualizar...");
-                        updateProductInBackend(emitter, authToken, productDto.productId(), comparison.getChangedFields());
+                        boolean updatedSuccessfully = updateProductInBackend(emitter, authToken, productDto.productId(), comparison.getChangedFields());
+                        if (updatedSuccessfully) {
+                            successfulUpdatesCount++; // Incrementa o contador
+                        }
                     } else {
                         sendSseEvent(emitter, "SUCCESS", "--> Produto " + productIdentifier + ": OK, sem alterações.");
                     }
@@ -96,7 +95,7 @@ public class ProductSyncService {
                 }
             }
 
-            sendSseEvent(emitter, "END", "Processo de sincronização concluído.");
+            sendFinalReport(emitter, productDtosFromDb.size(), successfulUpdatesCount);
 
         } catch (Exception e) {
             sendSseEvent(emitter, "ERROR", "ERRO CRÍTICO: " + e.getMessage());
@@ -111,10 +110,11 @@ public class ProductSyncService {
 
     /**
      * Monta o payload e envia a requisição de atualização para o backend.
+     * @return true se a atualização foi bem-sucedida, false caso contrário.
      */
-    private void updateProductInBackend(SseEmitter emitter, String authToken, UUID productId, Map<String, FieldChange> changedFields) {
+    private boolean updateProductInBackend(SseEmitter emitter, String authToken, UUID productId, Map<String, FieldChange> changedFields) {
         Map<String, Object> updatePayload = new HashMap<>();
-        updatePayload.put("productId", productId); // Adiciona o ID para o backend saber qual produto atualizar
+        updatePayload.put("productId", productId);
 
         changedFields.forEach((fieldName, fieldChange) -> {
             updatePayload.put(fieldName, fieldChange.getNewValue());
@@ -126,16 +126,17 @@ public class ProductSyncService {
             ResponseEntity<Void> updateResponse = casaMorenoClient.updateProduct(authToken, updatePayload);
             if (updateResponse.getStatusCode().is2xxSuccessful()) {
                 sendSseEvent(emitter, "SUCCESS", "    => Produto atualizado com sucesso no backend!");
+                return true;
             } else {
                 sendSseEvent(emitter, "ERROR", "    => Falha ao atualizar no backend. Status: " + updateResponse.getStatusCode());
+                return false;
             }
         } catch (Exception e) {
             sendSseEvent(emitter, "ERROR", "    => ERRO ao chamar a API de atualização: " + e.getMessage());
             logger.error("Erro detalhado na chamada de update para o produto {}", productId, e);
+            return false;
         }
     }
-
-    // (O restante dos métodos permanece igual)
 
     private String getAuthToken() {
         CasaMorenoLoginRequest loginRequest = new CasaMorenoLoginRequest(backendUsername, backendPassword);
@@ -168,7 +169,6 @@ public class ProductSyncService {
 
     private ProductComparisonResult compareFields(ProductInfo oldInfo, ProductInfo newInfo) {
         Map<String, FieldChange> changes = new HashMap<>();
-
         comparePrices(changes, "currentPrice", oldInfo.getCurrentPrice(), newInfo.getCurrentPrice());
         comparePrices(changes, "originalPrice", oldInfo.getOriginalPrice(), newInfo.getOriginalPrice());
         compareAndRegisterChange(changes, "discountPercentage", oldInfo.getDiscountPercentage(), newInfo.getDiscountPercentage());
@@ -197,6 +197,16 @@ public class ProductSyncService {
         if (oldValue.compareTo(newValue) != 0) {
             changes.put(fieldName, new FieldChange(oldValue, newValue));
         }
+    }
+
+    private void sendFinalReport(SseEmitter emitter, int totalProducts, long successfulUpdates) {
+        sendSseEvent(emitter, "INFO", "======================================================");
+        sendSseEvent(emitter, "INFO", "RELATÓRIO DE SINCRONIZAÇÃO FINALIZADO");
+        sendSseEvent(emitter, "INFO", "======================================================");
+
+        sendSseEvent(emitter, "INFO", "Total de produtos verificados: " + totalProducts);
+        sendSseEvent(emitter, "SUCCESS", "Total de produtos atualizados no backend: " + successfulUpdates);
+        sendSseEvent(emitter, "INFO", "======================================================");
     }
 
     private void sendSseEvent(SseEmitter emitter, String level, String message) {
