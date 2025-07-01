@@ -32,19 +32,11 @@ public class MercadoLivreApiController {
         }
     }
 
-    /**
-     * Endpoint de streaming para o relatório de sincronização.
-     * O cliente se conecta a este endpoint para receber os logs em tempo real.
-     */
     @GetMapping("/sync/stream")
     public SseEmitter streamSyncEvents() {
-        // Timeout longo para manter a conexão aberta durante o processo.
         SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
-
-        // Dispara o processo assíncrono, passando o emitter para ele.
         productSyncService.runFullSynchronization(emitter);
 
-        // Retorna o emitter imediatamente para o cliente.
         return emitter;
     }
 }
