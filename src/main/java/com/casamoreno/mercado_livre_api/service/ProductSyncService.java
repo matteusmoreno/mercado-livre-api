@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 @Service
 public class ProductSyncService {
@@ -89,6 +90,8 @@ public class ProductSyncService {
                     } else {
                         sendSseEvent(emitter, "SUCCESS", "--> Produto " + productIdentifier + ": OK, sem alterações.");
                     }
+
+                    TimeUnit.SECONDS.sleep(7);
 
                 } catch (Exception e) {
                     sendSseEvent(emitter, "ERROR", "--> Falha ao processar " + productIdentifier + ": " + e.getMessage());
