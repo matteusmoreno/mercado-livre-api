@@ -11,7 +11,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-@FeignClient(name = "casaMorenoClient", url = "https://api.casa-moreno.com")
+//@FeignClient(name = "casaMorenoClient", url = "https://api.casa-moreno.com")
+@FeignClient(name = "casaMorenoClient", url = "https://www.casa-moreno.com")
 public interface CasaMorenoClient {
 
     @PostMapping("/login")
